@@ -1,0 +1,18 @@
+# Use this instead of the GitHub workflow if your code lives in Azure DevOps.
+trigger:
+  - main
+pr:
+  - main
+pool:
+  vmImage: ubuntu-latest
+steps:
+  - script: |
+      git clone --depth 1 -b stable https://github.com/flutter/flutter.git $(Pipeline.Workspace)/flutter
+      echo "##vso[task.prependpath]$(Pipeline.Workspace)/flutter/bin"
+    displayName: Install Flutter
+  - script: flutter pub get
+    displayName: Packages
+  - script: flutter analyze --no-fatal-infos
+    displayName: Analyze
+  - script: flutter test
+    displayName: Test
