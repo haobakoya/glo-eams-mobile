@@ -39,6 +39,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
     DeviceOrientation.landscapeRight: 270,
   };
 
+  // Per-phase time budgets. Each phase gets its own fresh timer.
+  static const Duration _alignLimit = Duration(seconds: 20);
+  static const Duration _challengeLimit = Duration(seconds: 15);
+  static const Duration _captureLimit = Duration(seconds: 10);
+
+  // Detection thresholds.
+  static const double _closedEyeThreshold = 0.4; // was 0.25
+  static const double _turnYawThreshold = 15; // was 20
+
   CameraController? _cam;
   CameraDescription? _desc;
 
@@ -58,10 +67,12 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
   bool _done = false;
   bool _starting = false;
   bool _loggedFirstDetection = false;
+  bool _loggedFirstInput = false;
   bool _disposed = false;
 
   int _frontal = 0;
   int _still = 0;
+  int _dbg = 0;
 
   bool _sawClosed = false;
   double _rw = 1;
@@ -73,9 +84,38 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
   String? _lastLoggedDetectionError;
 
   Timer? _timeout;
+  final Stopwatch _sw = Stopwatch();
 
   void _log(String message) {
     unawaited(FaceDiagnosticLog.write(message));
+  }
+
+  /// Cancels any running timer and starts a fresh one for the current phase.
+  void _armTimeout(Duration limit) {
+    _timeout?.cancel();
+
+    _sw
+      ..reset()
+      ..start();
+
+    _log(
+      'FACE FLOW: timer armed; phase=$_phase; '
+      'challenge=$_challenge; limit=${limit.inSeconds}s',
+    );
+
+    _timeout = Timer(limit, () {
+      if (_done || !mounted || _disposed) return;
+
+      _log(
+        'FACE FLOW TIMEOUT: phase=$_phase; challenge=$_challenge; '
+        'elapsed=${_sw.elapsedMilliseconds}ms; frontal=$_frontal; '
+        'still=$_still; sawClosed=$_sawClosed; '
+        'lastDiagnostic=$_lastFrameDiagnostic; '
+        'lastDetectionError=$_lastDetectionError',
+      );
+
+      _fail('Timed out. Please try again.');
+    });
   }
 
   @override
@@ -164,20 +204,8 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
         'streaming=${controller.value.isStreamingImages}',
       );
 
-      _timeout?.cancel();
-
-      _timeout = Timer(const Duration(seconds: 25), () {
-        if (!_done && mounted && !_disposed) {
-          _log(
-            'FACE CAMERA TIMEOUT: '
-            'phase=$_phase, frontal=$_frontal, still=$_still, '
-            'lastDiagnostic=$_lastFrameDiagnostic, '
-            'lastDetectionError=$_lastDetectionError',
-          );
-
-          _fail('Timed out. Please try again.');
-        }
-      });
+      // Alignment phase gets its own budget.
+      _armTimeout(_alignLimit);
     } catch (e, st) {
       await FaceDiagnosticLog.write(
         'FACE CAMERA INIT ERROR: $e\nSTACK TRACE:\n$st',
@@ -237,12 +265,14 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
       _busy = false;
       _frontal = 0;
       _still = 0;
+      _dbg = 0;
       _sawClosed = false;
       _rw = 1;
       _lastFrameDiagnostic = null;
       _lastDetectionError = null;
       _lastLoggedDetectionError = null;
       _loggedFirstDetection = false;
+      _loggedFirstInput = false;
     });
 
     await _init();
@@ -369,18 +399,33 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
     var position = 0;
 
     // Copy the Y plane without row padding.
-    for (var row = 0; row < height; row++) {
-      final rowStart = row * yRowStride;
+    if (yPixelStride == 1) {
+      // Fast path: whole rows can be block-copied.
+      for (var row = 0; row < height; row++) {
+        final rowStart = row * yRowStride;
 
-      for (var col = 0; col < width; col++) {
-        final index = rowStart + col * yPixelStride;
-
-        if (index >= yBytes.length) {
+        if (rowStart + width > yBytes.length) {
           _diagnoseFrame('Y plane buffer too short');
           return null;
         }
 
-        output[position++] = yBytes[index];
+        output.setRange(position, position + width, yBytes, rowStart);
+        position += width;
+      }
+    } else {
+      for (var row = 0; row < height; row++) {
+        final rowStart = row * yRowStride;
+
+        for (var col = 0; col < width; col++) {
+          final index = rowStart + col * yPixelStride;
+
+          if (index >= yBytes.length) {
+            _diagnoseFrame('Y plane buffer too short');
+            return null;
+          }
+
+          output[position++] = yBytes[index];
+        }
       }
     }
 
@@ -485,12 +530,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
         return null;
       }
 
-      _log(
-        'FACE INPUT: iOS BGRA validated; '
-        'bytes=${plane.bytes.length}, '
-        'rowBytes=${plane.bytesPerRow}, '
-        'size=${width}x$height, rotation=$rotation',
-      );
+      if (!_loggedFirstInput) {
+        _loggedFirstInput = true;
+        _log(
+          'FACE INPUT: iOS BGRA validated; '
+          'bytes=${plane.bytes.length}, '
+          'rowBytes=${plane.bytesPerRow}, '
+          'size=${width}x$height, rotation=$rotation',
+        );
+      }
 
       return InputImage.fromBytes(
         bytes: plane.bytes,
@@ -557,11 +605,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
 
       if (nv21 == null) return null;
 
-      _log(
-        'FACE INPUT: Android packed NV21; '
-        'bytes=${nv21.length}, '
-        'size=${width}x$height, rotation=$rotation',
-      );
+      // Logged once per run instead of on every frame.
+      if (!_loggedFirstInput) {
+        _loggedFirstInput = true;
+        _log(
+          'FACE INPUT: Android packed NV21; '
+          'bytes=${nv21.length}, '
+          'size=${width}x$height, rotation=$rotation',
+        );
+      }
 
       return InputImage.fromBytes(
         bytes: nv21,
@@ -609,6 +661,14 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
 
       if (faces.length != 1) {
         _frontal = 0;
+
+        if (_phase == _Phase.challenge && ++_dbg % 5 == 0) {
+          _log(
+            'FACE CHALLENGE: $_challenge faces=${faces.length} '
+            '(need exactly 1); elapsed=${_sw.elapsedMilliseconds}ms',
+          );
+        }
+
         _setMsg(
           faces.isEmpty ? 'No face found' : 'Only one person, please',
         );
@@ -621,6 +681,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
       final rightEye = face.rightEyeOpenProbability ?? 1.0;
       final yaw = face.headEulerAngleY ?? 0.0;
       final eyesOpen = leftEye > 0.6 && rightEye > 0.6;
+
+      if (_phase == _Phase.challenge && ++_dbg % 5 == 0) {
+        _log(
+          'FACE CHALLENGE: $_challenge yaw=${yaw.toStringAsFixed(1)} '
+          'L=${leftEye.toStringAsFixed(2)} '
+          'R=${rightEye.toStringAsFixed(2)} '
+          'sawClosed=$_sawClosed; elapsed=${_sw.elapsedMilliseconds}ms',
+        );
+      }
 
       switch (_phase) {
         case _Phase.align:
@@ -637,11 +706,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
               _phase = _Phase.capture;
               _still = 0;
               _log('FACE FLOW: Alignment passed; capture phase');
+              _armTimeout(_captureLimit);
               _setMsg('Hold still');
             } else {
               _phase = _Phase.challenge;
+              _sawClosed = false;
+              _dbg = 0;
 
               _log('FACE FLOW: Alignment passed; challenge=$_challenge');
+              _armTimeout(_challengeLimit);
 
               _setMsg(
                 _challenge == _Challenge.blink
@@ -656,19 +729,24 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
           var passed = false;
 
           if (_challenge == _Challenge.blink) {
-            if (leftEye < 0.25 && rightEye < 0.25) {
+            if (leftEye < _closedEyeThreshold &&
+                rightEye < _closedEyeThreshold) {
               _sawClosed = true;
             }
 
             passed = _sawClosed && eyesOpen;
           } else {
-            passed = yaw.abs() > 20;
+            passed = yaw.abs() > _turnYawThreshold;
           }
 
           if (passed) {
             _phase = _Phase.capture;
             _still = 0;
-            _log('FACE FLOW: Liveness challenge passed');
+            _log(
+              'FACE FLOW: Liveness challenge passed; '
+              'elapsed=${_sw.elapsedMilliseconds}ms',
+            );
+            _armTimeout(_captureLimit);
             _setMsg('Good. Look straight and hold still');
           }
           break;

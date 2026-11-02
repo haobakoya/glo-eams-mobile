@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../../core/services/history_sync.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -87,6 +88,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _refresh() async {
+    await HistorySync.pullIfNeeded();
     final now = DateTime.now();
     final midnight = DateTime(now.year, now.month, now.day);
     final recent = await DbService.recent(limit: 30);
